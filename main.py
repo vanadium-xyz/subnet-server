@@ -22,8 +22,10 @@ Usage:
 """
 from __future__ import annotations
 
+import json
 import os
 import secrets
+import subprocess
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -115,26 +117,6 @@ class User(BaseModel):
     created_at = DateTimeField(default=datetime.utcnow)
 
 
-class Config(BaseModel):
-    """Singleton-ish key/value store (e.g. resolved room ids)."""
-    key = CharField(unique=True)
-    value = TextField(default="")
-
-
-def get_config(key: str) -> str:
-    row = Config.get_or_none(Config.key == key)
-    return row.value if row else ""
-
-
-def set_config(key: str, value: str) -> None:
-    row = Config.get_or_none(Config.key == key)
-    if row is None:
-        Config.create(key=key, value=value)
-    else:
-        row.value = value
-        row.save()
-
-
 def ensure_database() -> None:
     conn = psycopg2.connect(dbname="postgres", host=PG_HOST)
     conn.autocommit = True
@@ -147,7 +129,7 @@ def ensure_database() -> None:
 
 def auto_migrate() -> None:
     migrator = PostgresqlMigrator(db)
-    for model in [User, Config]:
+    for model in [User]:
         table = model._meta.table_name
         cur = db.execute_sql(
             "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
@@ -164,7 +146,7 @@ def auto_migrate() -> None:
 def init_db() -> None:
     ensure_database()
     db.connect(reuse_if_open=True)
-    db.create_tables([User, Config])
+    db.create_tables([User])
     auto_migrate()
 
 
@@ -224,39 +206,6 @@ def matrix_set_displayname(access_token: str, user_id: str, name: str) -> None:
         print(f"[matrix] set_displayname {user_id}: {r.status_code} {r.text[:120]}")
 
 
-def matrix_create_room(access_token: str, name: str) -> str:
-    """Create a public, unencrypted room owned by the caller. Returns room_id."""
-    r = requests.post(
-        f"{MATRIX_URL}/_matrix/client/v3/createRoom",
-        headers={"Authorization": f"Bearer {access_token}"},
-        json={"name": name, "preset": "public_chat"},
-        timeout=30,
-    )
-    if r.status_code != 200:
-        raise RuntimeError(f"createRoom {name}: {r.status_code} {r.text[:200]}")
-    return r.json()["room_id"]
-
-
-def matrix_invite(steward_token: str, room_id: str, user_id: str) -> None:
-    requests.post(
-        f"{MATRIX_URL}/_matrix/client/v3/rooms/{room_id}/invite",
-        headers={"Authorization": f"Bearer {steward_token}"},
-        json={"user_id": user_id},
-        timeout=30,
-    )
-
-
-def matrix_join(user_token: str, room_id: str) -> bool:
-    r = requests.post(
-        f"{MATRIX_URL}/_matrix/client/v3/rooms/{room_id}/join",
-        headers={"Authorization": f"Bearer {user_token}"},
-        timeout=30,
-    )
-    body = r.text
-    already_in = "already" in body.lower() and "member" in body.lower()
-    return r.status_code == 200 or already_in
-
-
 def matrix_deactivate_user(steward_token: str, user_id: str, admin_room_id: str) -> None:
     """Deactivate (delete) a tuwunel Matrix account via the admin command room.
 
@@ -309,17 +258,47 @@ def ensure_steward() -> User:
     return user
 
 
-def ensure_rooms(steward: User) -> dict[str, str]:
-    """Resolve {room_name: room_id} for the auto-join rooms, creating any that
-    don't exist yet (the Steward owns them). Room ids are cached in Config."""
+# ────────────────────────── subnet CLI (acts as the Steward) ──────────────────────────
+# Room creation and invites go through the locally installed `subnet` utility,
+# which authenticates as the ETH-keyed admin agent (ETH_PRIVATE_KEY +
+# SUBNET_API_BASE from the environment). This is the same identity as the
+# Steward, so the CLI creates/owns the auto-join rooms and issues their invites.
+def _subnet(args: list[str]) -> subprocess.CompletedProcess:
+    env = {**os.environ, "SUBNET_SIGN_MESSAGE": SIGN_MESSAGE}
+    return subprocess.run(["subnet", *args], capture_output=True, text=True, timeout=60, env=env)
+
+
+def subnet_joined_rooms() -> dict[str, str]:
+    """{room_name: room_id} for rooms the Steward has joined."""
+    p = _subnet(["joined-rooms", "--no-spaces"])
+    if p.returncode != 0:
+        raise RuntimeError(f"subnet joined-rooms failed: {(p.stderr or p.stdout)[:200]}")
+    return {r["name"]: r["room_id"] for r in json.loads(p.stdout or "[]")}
+
+
+def subnet_create_room(name: str) -> str:
+    p = _subnet(["create-room", "--name", name, "--public", "--unencrypted"])
+    if p.returncode != 0:
+        raise RuntimeError(f"subnet create-room {name} failed: {(p.stderr or p.stdout)[:200]}")
+    return json.loads(p.stdout)["room_id"]
+
+
+def subnet_invite_user(room_id: str, user_id: str) -> None:
+    p = _subnet(["invite-user", room_id, user_id])
+    if p.returncode != 0:
+        raise RuntimeError(f"subnet invite-user {user_id} → {room_id} failed: {(p.stderr or p.stdout)[:200]}")
+
+
+def ensure_rooms() -> dict[str, str]:
+    """Resolve {room_name: room_id} for the auto-join rooms via the CLI,
+    creating any the Steward hasn't already (e.g. General on first use)."""
+    joined = subnet_joined_rooms()
     rooms: dict[str, str] = {}
     for name in AUTO_JOIN_ROOMS:
-        cfg_key = f"room:{name}"
-        room_id = get_config(cfg_key)
+        room_id = joined.get(name)
         if not room_id:
-            room_id = matrix_create_room(steward.matrix_access_token, name)
-            set_config(cfg_key, room_id)
-            print(f"[matrix] created room {name} → {room_id}")
+            room_id = subnet_create_room(name)
+            print(f"[subnet] created room {name} → {room_id}")
         rooms[name] = room_id
     return rooms
 
@@ -328,8 +307,10 @@ def ensure_rooms(steward: User) -> dict[str, str]:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
-    steward = ensure_steward()
-    ensure_rooms(steward)
+    # Register the Steward's Matrix account so the `subnet` CLI can later log in
+    # as the admin agent. Rooms are ensured lazily on the first add_user, since
+    # the CLI talks to this server, which isn't accepting requests yet here.
+    ensure_steward()
     yield
 
 
@@ -390,10 +371,11 @@ def credentials_row(u: User) -> dict:
 
 
 def provision_matrix_user(user: User) -> None:
-    """Register the user on tuwunel and invite/force-join them into every
-    auto-join room. Idempotent: re-running re-syncs missing pieces."""
-    steward = ensure_steward()
-    rooms = ensure_rooms(steward)
+    """Register the user on tuwunel and invite them (as the Steward, via the
+    `subnet` CLI) into every auto-join room. The user accepts the invites with
+    their own client — we don't force-join on their behalf."""
+    ensure_steward()
+    rooms = ensure_rooms()
 
     token = matrix_register(user.address, user.matrix_password)
     user.matrix_access_token = token
@@ -403,11 +385,8 @@ def provision_matrix_user(user: User) -> None:
     matrix_id = f"@{user.address}:{MATRIX_SERVER_NAME}"
     matrix_set_displayname(token, matrix_id, user.name or user.address)
     for name, room_id in rooms.items():
-        matrix_invite(steward.matrix_access_token, room_id, matrix_id)
-        if matrix_join(token, room_id):
-            print(f"[matrix] joined {matrix_id} → {name}")
-        else:
-            print(f"[matrix] join {matrix_id} → {name} failed")
+        subnet_invite_user(room_id, matrix_id)
+        print(f"[subnet] invited {matrix_id} → {name}")
 
 
 # ────────────────────────── public / user endpoints ──────────────────────────

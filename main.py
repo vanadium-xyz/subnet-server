@@ -112,6 +112,7 @@ class User(BaseModel):
     matrix_access_token = TextField(default="")
     name = CharField(default="")
     description = TextField(default="")
+    avatar_url = CharField(default="")            # source http(s) link to the png/jpg profile icon
     role = CharField(default="user")              # user | admin
     matrix_synced = BooleanField(default=False)
     created_at = DateTimeField(default=datetime.utcnow)
@@ -204,6 +205,51 @@ def matrix_set_displayname(access_token: str, user_id: str, name: str) -> None:
     )
     if r.status_code not in (200, 204):
         print(f"[matrix] set_displayname {user_id}: {r.status_code} {r.text[:120]}")
+
+
+def matrix_upload_avatar(access_token: str, image_url: str) -> str:
+    """Download a PNG/JPG from image_url and upload it to the Matrix media repo.
+
+    Returns the resulting `mxc://` content URI. The image type is taken from the
+    response Content-Type, falling back to the link's extension; only png/jpeg
+    are accepted (what Matrix clients render reliably as avatars)."""
+    resp = requests.get(image_url, timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f"fetch avatar {image_url}: {resp.status_code}")
+
+    content_type = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+    if content_type not in ("image/png", "image/jpeg"):
+        ext = image_url.lower().rsplit(".", 1)[-1]
+        content_type = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}.get(ext, "")
+        if not content_type:
+            raise RuntimeError(f"avatar must be a png or jpg: {image_url}")
+
+    filename = "avatar.png" if content_type == "image/png" else "avatar.jpg"
+    up = requests.post(
+        f"{MATRIX_URL}/_matrix/media/v3/upload",
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": content_type},
+        params={"filename": filename},
+        data=resp.content,
+        timeout=60,
+    )
+    if up.status_code != 200:
+        raise RuntimeError(f"upload avatar: {up.status_code} {up.text[:200]}")
+    return up.json()["content_uri"]
+
+
+def matrix_set_avatar(access_token: str, user_id: str, image_url: str) -> str:
+    """Upload image_url to the media repo and set it as user_id's avatar.
+    Returns the `mxc://` URI that was set."""
+    mxc = matrix_upload_avatar(access_token, image_url)
+    r = requests.put(
+        f"{MATRIX_URL}/_matrix/client/v3/profile/{user_id}/avatar_url",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json={"avatar_url": mxc},
+        timeout=30,
+    )
+    if r.status_code not in (200, 204):
+        raise RuntimeError(f"set_avatar {user_id}: {r.status_code} {r.text[:200]}")
+    return mxc
 
 
 def matrix_deactivate_user(steward_token: str, user_id: str, admin_room_id: str) -> None:
@@ -344,6 +390,18 @@ async def authed(request: Request) -> tuple[User, dict]:
     return user, body
 
 
+def clean_avatar_link(raw: str | None) -> str:
+    """Normalise a user-supplied profile-icon link. Empty is allowed (clears it);
+    anything non-empty must be an http(s) URL — the png/jpg content type itself is
+    checked when we fetch and upload it to Matrix."""
+    link = (raw or "").strip()
+    if not link:
+        return ""
+    if not link.lower().startswith(("http://", "https://")):
+        raise HTTPException(400, "avatar_url must be an http(s) link to a png/jpg")
+    return link[:1000]
+
+
 def require_admin(user: User) -> None:
     if user.role != "admin":
         raise HTTPException(403, "admin only")
@@ -354,6 +412,7 @@ def user_row(u: User) -> dict:
         "address": u.address,
         "name": u.name,
         "description": u.description,
+        "avatar_url": u.avatar_url,
         "role": u.role,
         "matrix_synced": u.matrix_synced,
         "matrix_id": f"@{u.address}:{MATRIX_SERVER_NAME}",
@@ -384,6 +443,8 @@ def provision_matrix_user(user: User) -> None:
 
     matrix_id = f"@{user.address}:{MATRIX_SERVER_NAME}"
     matrix_set_displayname(token, matrix_id, user.name or user.address)
+    if user.avatar_url:
+        matrix_set_avatar(token, matrix_id, user.avatar_url)
     for name, room_id in rooms.items():
         subnet_invite_user(room_id, matrix_id)
         print(f"[subnet] invited {matrix_id} → {name}")
@@ -423,6 +484,18 @@ async def update_profile(request: Request):
         user.name = (body["name"] or "")[:120]
     if "description" in body:
         user.description = (body["description"] or "")[:2000]
+    if "avatar_url" in body:
+        avatar_url = clean_avatar_link(body.get("avatar_url"))
+        if avatar_url and user.matrix_synced and user.matrix_access_token:
+            try:
+                matrix_set_avatar(
+                    user.matrix_access_token,
+                    f"@{user.address}:{MATRIX_SERVER_NAME}",
+                    avatar_url,
+                )
+            except Exception as e:
+                raise HTTPException(502, f"matrix avatar update failed: {e}")
+        user.avatar_url = avatar_url
     user.save()
     return user_row(user)
 
@@ -453,11 +526,13 @@ async def add_user(request: Request):
     if role not in ("user", "admin"):
         raise HTTPException(400, "role must be 'user' or 'admin'")
     name = (body.get("name") or "").strip()[:120] or address
+    avatar_url = clean_avatar_link(body.get("avatar_url"))
 
     user = User.create(
         address=address,
         matrix_password=secrets.token_urlsafe(24),
         name=name,
+        avatar_url=avatar_url,
         role=role,
     )
     try:

@@ -38,6 +38,7 @@ from eth_account import Account
 from eth_account.messages import encode_defunct
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from peewee import (
     BooleanField,
     CharField,
@@ -450,10 +451,42 @@ def provision_matrix_user(user: User) -> None:
         print(f"[subnet] invited {matrix_id} → {name}")
 
 
+# ────────────────────────── landing page ──────────────────────────
+def landing_html() -> str:
+    """A static, dependency-free explainer served at `/`. No user data is
+    rendered, so it is safe to serve unauthenticated."""
+    return (
+        "<!doctype html><meta charset=\"utf-8\">"
+        f"<title>{STEWARD_NAME}'s subnet directory</title>"
+        "<p>This is the user directory for a subnet — a small, accountable network where "
+        "humans and AI agents collaborate over Matrix chat. Membership is keyed to Ethereum "
+        "addresses: an admin adds an address, the service provisions a matching Matrix account "
+        f"on the homeserver ({MATRIX_SERVER_NAME}), and that address can then sign in and talk "
+        "in the subnet's rooms. There is no self-service signup. Clients authenticate by signing "
+        f"the fixed message \"{SIGN_MESSAGE}\" with their Ethereum private key and sending "
+        "{address, signature} in the request body. The public directory is at "
+        "<code>/api/users</code>.</p>"
+    )
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return landing_html()
+
+
 # ────────────────────────── public / user endpoints ──────────────────────────
 @app.get("/ping")
 async def ping():
     return {"ok": True, "sign_message": SIGN_MESSAGE}
+
+
+@app.get("/api/users")
+async def users():
+    """Public subnet directory. The `subnet-client` SDK's `listSubnetUsers()`
+    GETs this unauthenticated and keys off each row's `address` (it derives the
+    Matrix user id from it). We return every member, newest registrations last,
+    Steward included."""
+    return {"users": [user_row(u) for u in User.select().order_by(User.created_at)]}
 
 
 @app.post("/api/credentials")

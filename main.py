@@ -22,6 +22,7 @@ Usage:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import secrets
@@ -80,6 +81,15 @@ STEWARD_ADDRESS = STEWARD_ACCOUNT.address.lower()
 # Rooms every new user is invited to and force-joined into on creation.
 AUTO_JOIN_ROOMS = [
     r.strip() for r in os.environ.get("AUTO_JOIN_ROOMS", "General").split(",") if r.strip()
+]
+
+# Additional ETH addresses that get role=admin at startup. The Steward is always
+# an admin; this is for off-host agents (e.g. the bottles provisioner) that need
+# to call admin endpoints by signing as themselves. They get a DB row and admin
+# role, but no Matrix account is provisioned — admin endpoints use the Steward
+# identity for any Matrix-side work.
+EXTRA_ADMINS = [
+    a.strip().lower() for a in os.environ.get("EXTRA_ADMINS", "").split(",") if a.strip()
 ]
 
 
@@ -312,6 +322,29 @@ def ensure_steward() -> User:
     return user
 
 
+def ensure_extra_admins() -> None:
+    """Bootstrap each EXTRA_ADMINS address as a role=admin user. Creates the DB
+    row if missing and upgrades the role if it had drifted. No Matrix account
+    is provisioned for them; admin endpoints that touch Matrix use the Steward."""
+    for address in EXTRA_ADMINS:
+        if not (address.startswith("0x") and len(address) == 42):
+            print(f"[admin] skipping invalid EXTRA_ADMINS entry: {address}")
+            continue
+        user = User.get_or_none(User.address == address)
+        if user is None:
+            User.create(
+                address=address,
+                matrix_password=secrets.token_urlsafe(24),
+                name=address,
+                role="admin",
+            )
+            print(f"[admin] created extra admin {address}")
+        elif user.role != "admin":
+            user.role = "admin"
+            user.save()
+            print(f"[admin] promoted {address} to admin")
+
+
 # ────────────────────────── subnet CLI (acts as the Steward) ──────────────────────────
 # Room creation and invites go through the locally installed `subnet` utility,
 # which authenticates as the ETH-keyed admin agent (ETH_PRIVATE_KEY +
@@ -365,6 +398,7 @@ async def lifespan(_: FastAPI):
     # as the admin agent. Rooms are ensured lazily on the first add_user, since
     # the CLI talks to this server, which isn't accepting requests yet here.
     ensure_steward()
+    ensure_extra_admins()
     yield
 
 
@@ -685,31 +719,39 @@ async def list_users(request: Request):
 async def add_user(request: Request):
     """Admin adds a member by ETH address. We generate a Matrix password,
     provision the account on tuwunel, and invite them into the auto-join rooms.
-    Returns the new user plus their Matrix credentials."""
+    Returns the new user plus their Matrix credentials.
+
+    The admin signs the request as themselves (`address` + `signature` in the
+    body are the admin's, validated by `authed`); the new user's ETH address
+    goes in `target_address`."""
     requester, body = await authed(request)
     require_admin(requester)
 
-    address = (body.get("address") or "").strip().lower()
-    if not (address.startswith("0x") and len(address) == 42):
-        raise HTTPException(400, "address must be a 0x-prefixed ETH address")
-    if User.get_or_none(User.address == address) is not None:
+    target_address = (body.get("target_address") or "").strip().lower()
+    if not (target_address.startswith("0x") and len(target_address) == 42):
+        raise HTTPException(400, "target_address must be a 0x-prefixed ETH address")
+    if User.get_or_none(User.address == target_address) is not None:
         raise HTTPException(409, "address already registered")
 
     role = body.get("role", "user")
     if role not in ("user", "admin"):
         raise HTTPException(400, "role must be 'user' or 'admin'")
-    name = (body.get("name") or "").strip()[:120] or address
+    name = (body.get("name") or "").strip()[:120] or target_address
     avatar_url = clean_avatar_link(body.get("avatar_url"))
 
     user = User.create(
-        address=address,
+        address=target_address,
         matrix_password=secrets.token_urlsafe(24),
         name=name,
         avatar_url=avatar_url,
         role=role,
     )
+    # provision_matrix_user shells out to the `subnet` CLI, which calls back
+    # into this server's /api/credentials over HTTP. If we run it inline we
+    # block the event loop and the CLI's callback can't be served — a self
+    # deadlock that surfaces as `subprocess timed out`. Run it on a thread.
     try:
-        provision_matrix_user(user)
+        await asyncio.to_thread(provision_matrix_user, user)
     except Exception as e:
         user.delete_instance()
         raise HTTPException(502, f"matrix provisioning failed: {e}")

@@ -9,5 +9,8 @@ env/
 # Local config / secrets
 .env
 
+# Uploaded subnet icon
+icon/
+
 # OS
 .DS_Store

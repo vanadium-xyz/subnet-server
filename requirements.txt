@@ -3,5 +3,6 @@ psycopg2-binary
 python-dotenv
 requests
 fastapi
+python-multipart
 uvicorn
 eth-account

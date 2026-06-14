@@ -36,9 +36,9 @@ import uvicorn
 from dotenv import load_dotenv
 from eth_account import Account
 from eth_account.messages import encode_defunct
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from peewee import (
     BooleanField,
     CharField,
@@ -65,6 +65,10 @@ MATRIX_REGISTRATION_TOKEN = os.environ.get("MATRIX_REGISTRATION_TOKEN", "")
 MATRIX_ADMIN_ROOM_ID = os.environ.get("MATRIX_ADMIN_ROOM_ID", "")
 SUBNET_API_BASE = os.environ.get("SUBNET_API_BASE", "")
 
+# Where the uploaded subnet icon (a png/jpg) is stored on disk. Served at
+# /api/icon and surfaced as an absolute url by /api/metadata.
+ICON_DIR = os.environ.get("ICON_DIR", os.path.join(os.path.dirname(__file__), "icon"))
+
 STEWARD_NAME = os.environ.get("STEWARD_NAME", "Steward")
 # The Steward IS the ETH-keyed admin from .env — one identity at the protocol
 # layer (signs subnet messages with this wallet) and the chat layer (Matrix
@@ -79,13 +83,16 @@ AUTO_JOIN_ROOMS = [
 ]
 
 
-def _derive_sign_message() -> str:
+def _derive_domain() -> str:
     host = urlparse(SUBNET_API_BASE).hostname or "localhost"
-    domain = host[len("subnet."):] if host.startswith("subnet.") else host
-    return f"{domain}-matrix-auth"
+    return host[len("subnet."):] if host.startswith("subnet.") else host
 
 
-SIGN_MESSAGE = _derive_sign_message()
+SUBNET_DOMAIN = _derive_domain()
+SIGN_MESSAGE = f"{SUBNET_DOMAIN}-matrix-auth"
+# Human-facing name for the subnet, returned by /api/metadata. Defaults to the
+# domain when unset.
+SUBNET_NAME = os.environ.get("SUBNET_NAME", "") or SUBNET_DOMAIN
 
 
 # ────────────────────────── models ──────────────────────────
@@ -408,6 +415,66 @@ def require_admin(user: User) -> None:
         raise HTTPException(403, "admin only")
 
 
+def require_local(request: Request) -> None:
+    """Branding is operator-only: it carries no ETH signature, so we accept it
+    only from the loopback interface (the steward running on the box)."""
+    host = request.client.host if request.client else ""
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(403, "branding is local-only")
+
+
+def icon_path() -> str | None:
+    """Disk path of the current subnet icon, or None if none has been uploaded."""
+    for name in ("icon.png", "icon.jpg"):
+        p = os.path.join(ICON_DIR, name)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def icon_url() -> str:
+    """Absolute url for the subnet icon, or "" when none is set. Absolute so the
+    bottles frontend can load it cross-origin from `subnet.<domain>`."""
+    if not icon_path():
+        return ""
+    base = SUBNET_API_BASE.rstrip("/")
+    return f"{base}/api/icon" if base else "/api/icon"
+
+
+def stored_name() -> str:
+    """Operator-set subnet name (via /admin), or "" when none has been set."""
+    p = os.path.join(ICON_DIR, "name.txt")
+    if not os.path.exists(p):
+        return ""
+    with open(p) as f:
+        return f.read().strip()
+
+
+def subnet_name() -> str:
+    """The subnet's display name: an operator override if set, else SUBNET_NAME."""
+    return stored_name() or SUBNET_NAME
+
+
+def save_icon(data: bytes, filename: str, content_type: str) -> None:
+    """Persist uploaded image bytes as the subnet icon, replacing any existing one.
+    Accepts png/jpg, inferring from the content type and falling back to the
+    filename extension."""
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct not in ("image/png", "image/jpeg"):
+        ext = (filename or "").lower().rsplit(".", 1)[-1]
+        ct = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}.get(ext, "")
+        if not ct:
+            raise HTTPException(400, "icon must be a png or jpg")
+    os.makedirs(ICON_DIR, exist_ok=True)
+    for name in ("icon.png", "icon.jpg"):
+        old = os.path.join(ICON_DIR, name)
+        if os.path.exists(old):
+            os.remove(old)
+    dest = os.path.join(ICON_DIR, "icon.png" if ct == "image/png" else "icon.jpg")
+    with open(dest, "wb") as f:
+        f.write(data)
+
+
 def user_row(u: User) -> dict:
     return {
         "address": u.address,
@@ -465,7 +532,36 @@ def landing_html() -> str:
         "in the subnet's rooms. There is no self-service signup. Clients authenticate by signing "
         f"the fixed message \"{SIGN_MESSAGE}\" with their Ethereum private key and sending "
         "{address, signature} in the request body. The public directory is at "
-        "<code>/api/users</code>.</p>"
+        "<code>/api/users</code>, and the subnet's name and icon at "
+        "<code>/api/metadata</code>.</p>"
+    )
+
+
+def admin_html() -> str:
+    """Local-only branding form. Posts name + optional icon to /api/set_branding
+    via fetch, so a human can rebrand the subnet without crafting curl."""
+    current = subnet_name().replace('"', "&quot;")
+    return (
+        "<!doctype html><meta charset=\"utf-8\">"
+        f"<title>{SUBNET_DOMAIN} · branding</title>"
+        "<body style=\"font-family:system-ui;max-width:520px;margin:40px auto;padding:0 16px\">"
+        "<h2>Subnet branding</h2>"
+        f"<p>Set the name and icon for <code>{SUBNET_DOMAIN}</code>. Leave a field blank to keep it.</p>"
+        "<form id=\"f\">"
+        f"<p><label>Name<br><input name=\"name\" value=\"{current}\" style=\"width:100%;padding:8px\"></label></p>"
+        "<p><label>Icon (png/jpg)<br><input type=\"file\" name=\"file\" accept=\"image/png,image/jpeg\"></label></p>"
+        "<button type=\"submit\" style=\"padding:8px 16px\">Save</button> <span id=\"s\"></span>"
+        "</form>"
+        "<p>Current icon:</p>"
+        "<img src=\"/api/icon\" alt=\"(none yet)\" style=\"max-width:96px;border:1px solid #ccc\" "
+        "onerror=\"this.replaceWith('(none yet)')\">"
+        "<script>"
+        "const f=document.getElementById('f'),s=document.getElementById('s');"
+        "f.onsubmit=async(e)=>{e.preventDefault();s.textContent=' saving…';"
+        "const r=await fetch('/api/set_branding',{method:'POST',body:new FormData(f)});"
+        "s.textContent=r.ok?' saved ✓':' error: '+await r.text();"
+        "if(r.ok)setTimeout(()=>location.reload(),700);};"
+        "</script></body>"
     )
 
 
@@ -478,6 +574,50 @@ async def index():
 @app.get("/ping")
 async def ping():
     return {"ok": True, "sign_message": SIGN_MESSAGE}
+
+
+@app.get("/api/metadata")
+async def metadata():
+    """Public subnet metadata: its name, domain, and icon url (empty when no icon
+    has been uploaded). The bottles frontend reads this to brand the left rail."""
+    return {"name": subnet_name(), "domain": SUBNET_DOMAIN, "icon_url": icon_url()}
+
+
+@app.get("/api/icon")
+async def icon():
+    p = icon_path()
+    if not p:
+        raise HTTPException(404, "no icon set")
+    return FileResponse(p, media_type="image/png" if p.endswith(".png") else "image/jpeg")
+
+
+@app.post("/api/set_branding")
+async def set_branding(
+    request: Request,
+    name: str = Form(default=""),
+    file: UploadFile | None = File(default=None),
+):
+    """Set the subnet's name and/or icon. Local-only — the operator runs it on the
+    box, by hand (curl) or via the /admin page. Both fields are optional, so the
+    name and icon can be updated independently."""
+    require_local(request)
+    if name.strip():
+        os.makedirs(ICON_DIR, exist_ok=True)
+        with open(os.path.join(ICON_DIR, "name.txt"), "w") as f:
+            f.write(name.strip()[:200])
+    if file is not None and file.filename:
+        data = await file.read()
+        if data:
+            save_icon(data, file.filename, file.content_type or "")
+    return {"name": subnet_name(), "domain": SUBNET_DOMAIN, "icon_url": icon_url()}
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin(request: Request):
+    """A tiny local-only branding form so the operator can set the subnet's name
+    and icon from a browser instead of crafting a multipart request by hand."""
+    require_local(request)
+    return admin_html()
 
 
 @app.get("/api/users")
